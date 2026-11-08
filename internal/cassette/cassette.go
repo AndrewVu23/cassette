@@ -51,7 +51,10 @@ type Request struct {
 type Response struct {
 	Status  int         `json:"status"`
 	Headers http.Header `json:"headers,omitempty"`
-	Chunks  []Chunk     `json:"chunks"`
+	// HeaderDelayMs is the time from the request reaching cassette to the response
+	// headers arriving: the model's time before it starts to reply. 0 in older tapes.
+	HeaderDelayMs int64   `json:"header_delay_ms,omitempty"`
+	Chunks        []Chunk `json:"chunks"`
 }
 
 // Chunk is a piece of the response body and when it arrived, in milliseconds

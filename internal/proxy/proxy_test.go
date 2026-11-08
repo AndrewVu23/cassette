@@ -391,3 +391,36 @@ func TestReplayNonJSONBody(t *testing.T) {
 		t.Errorf("non-JSON request was not found on replay (status %d)", status)
 	}
 }
+
+func TestRecordsWaitBeforeHeaders(t *testing.T) {
+	api := newFakeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond) // the model "thinking" before it replies
+		streamReply(w, r)
+	})
+	path := tempCassette(t)
+	base, _ := startProxy(t, Options{Mode: Record, Target: api.url, Store: cassette.NewStore(path)})
+	post(t, base+"/v1/messages", `{"stream":true}`)
+	if d := loadEventually(t, path, 1).Interactions[0].Response.HeaderDelayMs; d < 70 {
+		t.Errorf("header delay %dms, want about 80ms", d)
+	}
+}
+
+func TestReplayRealtimeWaitsBeforeHeaders(t *testing.T) {
+	path := seedStream(t, []int64{0, 0, 0})
+	s, _ := cassette.OpenStore(path, false)
+	i := s.Interactions()[0]
+	i.Response.HeaderDelayMs = 150
+	s2 := cassette.NewStore(path)
+	s2.Add(i)
+	if err := s2.Save(); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := cassette.OpenStore(path, true)
+	base, _ := startProxy(t, Options{Mode: Replay, Store: store, Realtime: true})
+
+	start := time.Now()
+	post(t, base+"/v1/messages", `{"stream":true}`)
+	if elapsed := time.Since(start); elapsed < 140*time.Millisecond {
+		t.Errorf("realtime replay took %v, want at least the 150ms header delay", elapsed)
+	}
+}

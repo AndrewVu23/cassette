@@ -12,9 +12,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/TemirlanN-dev/cassette/internal/cassette"
+	"github.com/TemirlanN-dev/cassette/internal/counters"
 	"github.com/TemirlanN-dev/cassette/internal/match"
 )
 
@@ -34,7 +36,9 @@ type Options struct {
 	Target   *url.URL // the real API; not used in Replay mode
 	Store    *cassette.Store
 	Matcher  *match.Matcher
-	Realtime bool // replay streamed chunks with their original timing
+	Realtime bool      // replay streamed chunks with their original timing
+	Scale    float64   // with Realtime, multiply recorded delays by this (0.5 = twice as fast)
+	Marks    io.Writer // if set, one JSON line with counters per replayed request start and end
 }
 
 type Proxy struct {
@@ -42,7 +46,13 @@ type Proxy struct {
 	store    *cassette.Store
 	matcher  *match.Matcher
 	realtime bool
+	scale    float64
 	forward  *httputil.ReverseProxy
+
+	pid    atomic.Int64 // the command cassette runs; 0 until it starts
+	markMu sync.Mutex
+	marks  *json.Encoder
+	seq    int // replayed requests so far
 
 	mu     sync.Mutex
 	index  map[string]cassette.Interaction // fingerprint -> recording
@@ -57,6 +67,7 @@ type ctxKey struct{}
 type exchange struct {
 	req         cassette.Request
 	fingerprint string
+	arrived     time.Time // when the request reached cassette
 }
 
 func New(o Options) *Proxy {
@@ -65,8 +76,15 @@ func New(o Options) *Proxy {
 		store:    o.Store,
 		matcher:  o.Matcher,
 		realtime: o.Realtime,
+		scale:    o.Scale,
 		index:    map[string]cassette.Interaction{},
 		used:     map[string]bool{},
+	}
+	if p.scale == 0 {
+		p.scale = 1 // unset means the recorded timing
+	}
+	if o.Marks != nil {
+		p.marks = json.NewEncoder(o.Marks)
 	}
 
 	// Build the lookup table once, so finding a recording is a single map lookup.
@@ -117,6 +135,7 @@ func (p *Proxy) Misses() int {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	arrived := time.Now()
 	// A body can only be read once: read it, keep the bytes, and put back a
 	// fresh reader over the same bytes so the proxy can still forward it.
 	body, err := io.ReadAll(r.Body)
@@ -133,7 +152,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if p.mode != Record {
 		if rec, ok := p.lookup(fp); ok {
+			seq := p.mark("req", 0)
 			p.replay(w, r, rec)
+			p.mark("end", seq)
 			return
 		}
 		if p.mode == Replay {
@@ -144,6 +165,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ex := exchange{
 		fingerprint: fp,
+		arrived:     arrived,
 		req: cassette.Request{
 			Method:  r.Method,
 			Path:    path,
@@ -152,6 +174,42 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	p.forward.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, ex)))
+}
+
+// SetPID tells the proxy which process to read counters from.
+func (p *Proxy) SetPID(pid int) { p.pid.Store(int64(pid)) }
+
+// mark writes one line of counters for the command. "req" (request arrived:
+// the previous tools are done) gets a new seq; "end" (reply sent: tools may
+// start) reuses the seq it is given. Returns the seq used.
+func (p *Proxy) mark(ev string, seq int) int {
+	if p.marks == nil {
+		return seq
+	}
+	t := counters.MonoNs()
+	wall := time.Now().UnixNano() // read next to t: a sync point for wall-clock logs such as OTel
+	pid := int(p.pid.Load())
+	s, ok := counters.Read(pid)
+	p.markMu.Lock()
+	defer p.markMu.Unlock()
+	if ev == "req" {
+		p.seq++
+		seq = p.seq
+	}
+	counters.Signpost(seq, ev == "end")
+	line := struct {
+		Seq   int    `json:"seq"`
+		Ev    string `json:"ev"`
+		TNs   int64  `json:"t_ns"`      // CLOCK_MONOTONIC
+		TWall int64  `json:"t_wall_ns"` // Unix time, same moment
+		OK    bool   `json:"ok"`        // false if counters could not be read
+		PID   int    `json:"pid"`
+		counters.Sample
+	}{seq, ev, t, wall, ok, pid, s}
+	if err := p.marks.Encode(line); err != nil {
+		log.Printf("writing marks: %v", err)
+	}
+	return seq
 }
 
 func (p *Proxy) lookup(fp string) (cassette.Interaction, bool) {
@@ -166,6 +224,13 @@ func (p *Proxy) lookup(fp string) (cassette.Interaction, bool) {
 
 // replay sends a recorded response: instantly, or with the original timing if realtime is on.
 func (p *Proxy) replay(w http.ResponseWriter, r *http.Request, rec cassette.Interaction) {
+	if p.realtime { // the model's time before its reply started
+		select {
+		case <-time.After(time.Duration(float64(rec.Response.HeaderDelayMs) * p.scale * float64(time.Millisecond))):
+		case <-r.Context().Done():
+			return
+		}
+	}
 	for k, v := range rec.Response.Headers {
 		w.Header()[k] = v
 	}
@@ -175,7 +240,7 @@ func (p *Proxy) replay(w http.ResponseWriter, r *http.Request, rec cassette.Inte
 	start := time.Now()
 	for _, c := range rec.Response.Chunks {
 		if p.realtime {
-			wait := time.Until(start.Add(time.Duration(c.OffsetMs) * time.Millisecond))
+			wait := time.Until(start.Add(time.Duration(float64(c.OffsetMs) * p.scale * float64(time.Millisecond))))
 			select {
 			case <-time.After(wait):
 			case <-r.Context().Done(): // the app hung up; stop sending
@@ -233,7 +298,8 @@ func (p *Proxy) captureResponse(resp *http.Response) error {
 				p.save(ex.fingerprint, cassette.Interaction{
 					RecordedAt: start.UTC(),
 					Request:    req,
-					Response:   cassette.Response{Status: status, Headers: headers, Chunks: chunks},
+					Response: cassette.Response{Status: status, Headers: headers, Chunks: chunks,
+						HeaderDelayMs: start.Sub(ex.arrived).Milliseconds()},
 				})
 			}
 		},

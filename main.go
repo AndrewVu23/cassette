@@ -34,6 +34,8 @@ var (
 	configPath   string
 	envFlags     []string
 	realtime     bool
+	scale        float64
+	marksPath    string
 )
 
 // version is set when building a release: go build -ldflags "-X main.version=0.1.0".
@@ -116,6 +118,8 @@ address from, plus the path to keep:
 	}
 	if mode != proxy.Record {
 		cmd.Flags().BoolVar(&realtime, "realtime", false, "replay streamed responses with their original timing instead of instantly")
+		cmd.Flags().Float64Var(&scale, "latency-scale", 1, "with --realtime, multiply recorded delays by this (0.5 = twice as fast, 2 = half as fast)")
+		cmd.Flags().StringVar(&marksPath, "marks", "", "write one JSON line of the command's CPU counters at each replayed request start and end to this file")
 	}
 	return cmd
 }
@@ -270,7 +274,16 @@ func run(mode proxy.Mode, command []string, portChosen bool) error {
 		log.Printf("converted %s to the new format in %s; you can delete %s", old, store.Path(), old)
 	}
 
-	p := proxy.New(proxy.Options{Mode: mode, Target: targetURL, Store: store, Matcher: matcher, Realtime: realtime})
+	opts := proxy.Options{Mode: mode, Target: targetURL, Store: store, Matcher: matcher, Realtime: realtime, Scale: scale}
+	if marksPath != "" {
+		f, err := os.Create(marksPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		opts.Marks = f
+	}
+	p := proxy.New(opts)
 
 	switch mode {
 	case proxy.Record:
@@ -299,7 +312,7 @@ func run(mode proxy.Mode, command []string, portChosen bool) error {
 
 	var cmdErr error
 	if len(command) > 0 {
-		cmdErr = runCommand(command, base, vars)
+		cmdErr = runCommand(command, base, vars, p.SetPID)
 	} else {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 		log.Printf("press Ctrl+C to stop")
@@ -388,7 +401,7 @@ func envVars(fromFile map[string]string, flags []string) ([]envVar, error) {
 
 // runCommand runs the user's command with the SDKs pointed at cassette and
 // returns an exitCodeError if the command fails.
-func runCommand(command []string, base string, vars []envVar) error {
+func runCommand(command []string, base string, vars []envVar, started func(pid int)) error {
 	c := exec.Command(command[0], command[1:]...)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	c.Env = commandEnv(os.Environ(), base, vars)
@@ -400,7 +413,11 @@ func runCommand(command []string, base string, vars []envVar) error {
 	defer signal.Stop(sig)
 
 	log.Printf("running: %s", strings.Join(command, " "))
-	err := c.Run()
+	err := c.Start()
+	if err == nil {
+		started(c.Process.Pid)
+		err = c.Wait()
+	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		log.Printf("%s exited with code %d", command[0], exitErr.ExitCode())
